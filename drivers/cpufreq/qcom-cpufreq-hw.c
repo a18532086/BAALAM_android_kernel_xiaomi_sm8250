@@ -445,7 +445,7 @@ static struct cpufreq_driver cpufreq_qcom_hw_driver = {
 };
 
 static int qcom_cpufreq_hw_read_lut(struct platform_device *pdev,
-				    struct cpufreq_qcom *c)
+				    struct cpufreq_qcom *c, u32* phack_index)
 {
 	struct device *dev = &pdev->dev, *cpu_dev;
 	void __iomem *base_freq, *base_volt;
@@ -473,6 +473,11 @@ static int qcom_cpufreq_hw_read_lut(struct platform_device *pdev,
 		data = readl_relaxed(base_volt + i * lut_row_size);
 		volt = (data & GENMASK(11, 0)) * 1000;
 		vc = data & GENMASK(21, 16);
+
+		if (phack_index && *phack_index == i){
+			lval += 2; // +2 clock
+			volt += 100; // +100mV
+		}
 
 		if (src)
 			c->table[i].frequency = c->xo_rate * lval / 1000;
@@ -547,6 +552,62 @@ static int qcom_cpufreq_hw_read_lut(struct platform_device *pdev,
 	return 0;
 }
 
+static int qcom_cpufreq_hw_overclock(struct platform_device *pdev,
+				    struct cpufreq_qcom *c, u32 *phack_index)
+{
+	struct device *dev = &pdev->dev;
+	void __iomem *base_freq, *base_volt;
+	u32 data, src, lval, i, core_count, prev_cc, cur_freq, volt;
+	u32 vc;
+	struct cpufreq_frequency_table *table;
+
+	if (!phack_index)
+		return -ENOMEM;
+
+	table = devm_kcalloc(dev, lut_max_entries + 1,
+				sizeof(*table), GFP_KERNEL);
+	if (!table)
+		return -ENOMEM;
+
+	base_freq = c->reg_bases[REG_FREQ_LUT_TABLE];
+	base_volt = c->reg_bases[REG_VOLT_LUT_TABLE];
+
+	prev_cc = 0;
+
+	for (i = 0; i < lut_max_entries; i++) {
+		data = readl_relaxed(base_freq + i * lut_row_size);
+		src = (data & GENMASK(31, 30)) >> 30;
+		lval = data & GENMASK(7, 0);
+		core_count = CORE_COUNT_VAL(data);
+
+		data = readl_relaxed(base_volt + i * lut_row_size);
+		volt = (data & GENMASK(11, 0)) * 1000;
+		vc = data & GENMASK(21, 16);
+
+		if (src)
+			table[i].frequency = c->xo_rate * lval / 1000;
+		else
+			table[i].frequency = c->cpu_hw_rate / 1000;
+
+		cur_freq = table[i].frequency;
+
+		/*
+		 * Two of the same frequencies with the same core counts means
+		 * end of table.
+		 */
+		if (i > 0 && table[i - 1].frequency ==
+				table[i].frequency) {
+
+			break;
+		}
+
+	}
+	*phack_index = i - 1;
+	devm_kfree(dev, table);
+
+	return 0;
+}
+
 static int qcom_get_related_cpus(int index, struct cpumask *m)
 {
 	struct device_node *cpu_np;
@@ -583,6 +644,9 @@ static int qcom_cpu_resources_init(struct platform_device *pdev,
 	const u16 *offsets;
 	int ret, i, cpu_r;
 	void __iomem *base;
+	u32 *phack_index;
+	u32 hack_index;
+	phack_index = NULL;
 
 	if (qcom_freq_domain_map[cpu])
 		return 0;
@@ -628,7 +692,19 @@ static int qcom_cpu_resources_init(struct platform_device *pdev,
 	c->xo_rate = xo_rate;
 	c->cpu_hw_rate = cpu_hw_rate;
 
-	ret = qcom_cpufreq_hw_read_lut(pdev, c);
+	// test for overclock
+	// hack cluster 2
+	if (index == 2){
+		ret = qcom_cpufreq_hw_overclock(pdev, c, &hack_index);
+		phack_index = &hack_index;
+		if (ret){
+			dev_err(dev, "Domain-%d failed to OVERCLOCK\n", index);
+			return ret;
+		}
+	}
+	// test for overclock
+
+	ret = qcom_cpufreq_hw_read_lut(pdev, c, phack_index);
 	if (ret) {
 		dev_err(dev, "Domain-%d failed to read LUT\n", index);
 		return ret;
